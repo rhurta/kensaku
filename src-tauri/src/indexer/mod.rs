@@ -15,6 +15,7 @@ use crate::embed::{EMBEDDING_DIM, EmbeddingQueue, ModelRegistry, Unit, UnitStore
 use crate::indexer::content::{
     ContentIndex, is_indexable_extension, is_indexable_file_name, read_text_content_checked,
 };
+use crate::indexer::extract::IndexMode;
 use crate::indexer::metadata::MetadataStore;
 use crate::indexer::walker::{FileEntry, is_cloud_placeholder_path, walk_directories};
 use crate::indexer::watcher::{WatcherHandle, start_file_watcher};
@@ -23,7 +24,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread;
@@ -295,7 +296,7 @@ impl IndexerManager {
     pub fn new(config: KensakuConfig) -> Self {
         // Apply the opt-in external extractor registry before any crawl starts.
         crate::indexer::extract::set_external_extractors(config.extractors.clone());
-        crate::indexer::extract::set_name_only_dirs(config.name_only_dirs.clone());
+        crate::indexer::extract::set_path_modes(&config.watched_dirs, &config.name_only_dirs);
         crate::indexer::extract::image::set_ocr_max_image_bytes(config.ocr_max_image_bytes);
         crate::indexer::extract::set_content_caps(config.content_max_file_size_mb, config.content_max_text_bytes, config.content_csv_head_rows);
         crate::embed::set_max_semantic_units(config.content_max_semantic_units);
@@ -418,7 +419,7 @@ impl IndexerManager {
     /// starting a watcher, so it can coexist with the daemon.
     pub fn new_readonly(config: KensakuConfig) -> Self {
         crate::indexer::extract::set_external_extractors(config.extractors.clone());
-        crate::indexer::extract::set_name_only_dirs(config.name_only_dirs.clone());
+        crate::indexer::extract::set_path_modes(&config.watched_dirs, &config.name_only_dirs);
         crate::indexer::extract::image::set_ocr_max_image_bytes(config.ocr_max_image_bytes);
         crate::indexer::extract::set_content_caps(config.content_max_file_size_mb, config.content_max_text_bytes, config.content_csv_head_rows);
         crate::embed::set_max_semantic_units(config.content_max_semantic_units);
@@ -1891,15 +1892,18 @@ impl IndexerManager {
     /// meaningful answer: the signature changed but nothing was left to
     /// re-read, and a crawl reason must not blame OCR for work it did not
     /// cause.
-    /// Brings the stored index in line with `name_only_dirs`.
+    /// Brings the stored index in line with the effective per-directory mode.
     ///
-    /// The directories applied by the previous crawl are recorded in
-    /// `name-only-state`; comparing against the configuration covers every way
-    /// the list can change (settings UI, daemon, a hand-edited config.json).
-    /// - A directory that became name-only loses its content documents and
-    ///   semantic units; its file names stay searchable.
-    /// - A directory that stopped being name-only has its files flagged
-    ///   pending, so the crawl extracts them even though they are unchanged.
+    /// Every watched root is a rule: names-only when it appears in
+    /// `name_only_dirs`, name + content otherwise. The deepest rule wins, so a
+    /// nested watched folder can re-enable content below a names-only parent.
+    /// The previous rule set is persisted in `name-only-state`; comparing the
+    /// effective mode of each stored file (rather than just the directory
+    /// lists) covers settings changes, adding or removing watched roots and a
+    /// hand-edited config.json.
+    /// - A file that became names-only loses its content document and units.
+    /// - A file that became name + content is flagged pending, so the crawl
+    ///   extracts it even though it is unchanged on disk.
     ///
     /// Returns how many files were flagged for extraction.
     fn sync_name_only_state(
@@ -1909,71 +1913,72 @@ impl IndexerManager {
         unit_store: &Arc<RwLock<UnitStore>>,
         visual_store: &Arc<RwLock<crate::embed::visual::VisualStore>>,
     ) -> usize {
-        let current: Vec<PathBuf> = config_arc.read().name_only_dirs.clone();
-        let previous = read_name_only_state();
+        let current = {
+            let cfg = config_arc.read();
+            IndexModeState::from_config(&cfg)
+        };
+        let previous = read_index_mode_state();
         if previous.as_ref() == Some(&current) {
             return 0;
         }
         let previous = previous.unwrap_or_default();
 
-        let added: Vec<PathBuf> = current
-            .iter()
-            .filter(|dir| !previous.iter().any(|old| dir.starts_with(old)))
-            .cloned()
-            .collect();
-        let removed: Vec<PathBuf> = previous
-            .iter()
-            .filter(|dir| !current.iter().any(|new| dir.starts_with(new)))
-            .cloned()
-            .collect();
-
-        if !added.is_empty() {
-            let (paths, ids): (Vec<PathBuf>, HashSet<u64>) = {
-                let store = metadata.read();
-                let mut paths = Vec::new();
-                let mut ids = HashSet::new();
-                for i in 0..store.len() {
-                    let entry = store.materialize(i as u32);
-                    if !entry.is_dir && added.iter().any(|dir| entry.path.starts_with(dir)) {
+        let (to_drop, to_drop_ids, to_read) = {
+            let store = metadata.read();
+            let mut to_drop: Vec<PathBuf> = Vec::new();
+            let mut to_drop_ids: HashSet<u64> = HashSet::new();
+            let mut to_read: Vec<PathBuf> = Vec::new();
+            for i in 0..store.len() {
+                let entry = store.materialize(i as u32);
+                if entry.is_dir {
+                    continue;
+                }
+                match (previous.mode_for(&entry.path), current.mode_for(&entry.path)) {
+                    (IndexMode::NameAndContent, IndexMode::NamesOnly) => {
                         if entry.id > 0 {
-                            ids.insert(entry.id);
+                            to_drop_ids.insert(entry.id);
                         }
-                        paths.push(entry.path);
+                        to_drop.push(entry.path);
                     }
-                }
-                (paths, ids)
-            };
-            if !paths.is_empty() {
-                if let Some(c_index) = content_index.read().as_ref() {
-                    let _ = c_index.remove_many(&paths);
-                    let _ = c_index.commit();
-                }
-                if !ids.is_empty() {
-                    let id_vec: Vec<u64> = ids.iter().copied().collect();
-                    if let Some(db) = metadata.read().db() {
-                        let _ = db.delete_units_for_nodes(&id_vec);
-                        let _ = db.delete_visual_units_for_nodes(&id_vec);
+                    (IndexMode::NamesOnly, IndexMode::NameAndContent) => {
+                        to_read.push(entry.path);
                     }
-                    unit_store.write().remove_units_for_nodes(&ids);
-                    for id in &ids {
-                        visual_store.write().remove_node(*id);
-                    }
+                    _ => {}
                 }
-                crate::say_err!(
-                    "[Kensaku] Name-only directories: dropped content of {} file(s)",
-                    paths.len()
-                );
             }
-        }
+            (to_drop, to_drop_ids, to_read)
+        };
 
-        let marked = metadata.write().mark_dirs_pending(&removed);
-        if marked > 0 {
+        if !to_drop.is_empty() {
+            if let Some(c_index) = content_index.read().as_ref() {
+                let _ = c_index.remove_many(&to_drop);
+                let _ = c_index.commit();
+            }
+            if !to_drop_ids.is_empty() {
+                let ids: Vec<u64> = to_drop_ids.iter().copied().collect();
+                if let Some(db) = metadata.read().db() {
+                    let _ = db.delete_units_for_nodes(&ids);
+                    let _ = db.delete_visual_units_for_nodes(&ids);
+                }
+                unit_store.write().remove_units_for_nodes(&to_drop_ids);
+                for id in &to_drop_ids {
+                    visual_store.write().remove_node(*id);
+                }
+            }
             crate::say_err!(
-                "[Kensaku] Directories left name-only mode: {marked} file(s) queued for extraction"
+                "[Kensaku] Names-only: dropped content of {} file(s)",
+                to_drop.len()
             );
         }
 
-        write_name_only_state(&current);
+        let marked = metadata.write().mark_paths_pending(&to_read);
+        if marked > 0 {
+            crate::say_err!(
+                "[Kensaku] Paths enabled for content: {marked} file(s) queued for extraction"
+            );
+        }
+
+        write_index_mode_state(&current);
         marked
     }
 
@@ -2112,7 +2117,11 @@ impl IndexerManager {
         let ocr_changed =
             previous.ocr_enabled != config.ocr_enabled || previous.ocr_engine != config.ocr_engine;
         let extractors_changed = previous.extractors != config.extractors;
-        let name_only_changed = previous.name_only_dirs != config.name_only_dirs;
+        // Adding a nested watched root changes the effective mode of its files
+        // even when name_only_dirs is untouched, so both lists are part of the
+        // signature that triggers a reconcile crawl.
+        let mode_changed = previous.watched_dirs != config.watched_dirs
+            || previous.name_only_dirs != config.name_only_dirs;
         // Raising a content cap only helps files that were cut off before, and
         // those are unchanged on disk, so they need an explicit re-read.
         let caps_raised = config.content_max_file_size_mb > previous.content_max_file_size_mb
@@ -2127,9 +2136,9 @@ impl IndexerManager {
         crate::embed::set_max_semantic_units(config.content_max_semantic_units);
 
         let mut reindex = false;
-        if name_only_changed {
+        if mode_changed {
             // The crawl reconciles the stored index (see `sync_name_only_state`).
-            crate::indexer::extract::set_name_only_dirs(config.name_only_dirs.clone());
+            crate::indexer::extract::set_path_modes(&config.watched_dirs, &config.name_only_dirs);
             crate::indexer::extract::clear_cache();
             reindex = true;
         }
@@ -2273,21 +2282,72 @@ fn name_only_state_path() -> PathBuf {
     KensakuConfig::config_dir().join("name-only-state")
 }
 
-/// The name-only directories the index was last reconciled with, or `None`
-/// when nothing was ever recorded.
-fn read_name_only_state() -> Option<Vec<PathBuf>> {
-    let raw = std::fs::read_to_string(name_only_state_path()).ok()?;
-    serde_json::from_str(&raw).ok()
+/// The directory rules the index was last reconciled with.
+///
+/// Stored as normalized path strings so a restart compares exactly the same
+/// keys the in-memory resolver uses. `watched` is part of the signature:
+/// adding a nested watched root changes the effective mode of its files even
+/// when `name_only_dirs` is untouched.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct IndexModeState {
+    watched: Vec<String>,
+    names_only: Vec<String>,
 }
 
-fn write_name_only_state(dirs: &[PathBuf]) {
-    match serde_json::to_string(dirs) {
+impl IndexModeState {
+    fn from_config(config: &KensakuConfig) -> Self {
+        let mut watched: Vec<String> = config
+            .watched_dirs
+            .iter()
+            .map(|p| crate::indexer::extract::rule_key(p))
+            .collect();
+        let mut names_only: Vec<String> = config
+            .name_only_dirs
+            .iter()
+            .map(|p| crate::indexer::extract::rule_key(p))
+            .collect();
+        watched.sort();
+        watched.dedup();
+        names_only.sort();
+        names_only.dedup();
+        Self { watched, names_only }
+    }
+
+    fn mode_for(&self, path: &Path) -> IndexMode {
+        crate::indexer::extract::mode_from_rules(&self.watched, &self.names_only, path)
+    }
+}
+
+/// Reads the last reconciled rules, or `None` when nothing was ever recorded.
+/// Older installs stored a bare `Vec<PathBuf>` of names-only directories;
+/// accepting that shape makes the first run after an upgrade reconcile from
+/// the legacy state instead of assuming every file had content.
+fn read_index_mode_state() -> Option<IndexModeState> {
+    let raw = std::fs::read_to_string(name_only_state_path()).ok()?;
+    if let Ok(state) = serde_json::from_str::<IndexModeState>(&raw) {
+        return Some(state);
+    }
+    let legacy: Vec<PathBuf> = serde_json::from_str(&raw).ok()?;
+    let mut names_only: Vec<String> = legacy
+        .iter()
+        .map(|p| crate::indexer::extract::rule_key(p))
+        .collect();
+    names_only.sort();
+    names_only.dedup();
+    Some(IndexModeState {
+        watched: Vec::new(),
+        names_only,
+    })
+}
+
+fn write_index_mode_state(state: &IndexModeState) {
+    match serde_json::to_string(state) {
         Ok(raw) => {
             if let Err(e) = std::fs::write(name_only_state_path(), raw) {
-                crate::say_err!("[Kensaku] could not record name-only state: {e}");
+                crate::say_err!("[Kensaku] could not record index-mode state: {e}");
             }
         }
-        Err(e) => crate::say_err!("[Kensaku] could not encode name-only state: {e}"),
+        Err(e) => crate::say_err!("[Kensaku] could not encode index-mode state: {e}"),
     }
 }
 

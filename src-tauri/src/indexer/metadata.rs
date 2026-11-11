@@ -483,6 +483,38 @@ impl MetadataStore {
         marked
     }
 
+    /// Flags exactly these files for a content re-read. Used when a path's
+    /// effective index mode changes back to "name + content": the files are
+    /// unchanged on disk, so the incremental crawl would otherwise skip them.
+    pub fn mark_paths_pending(&mut self, paths: &[PathBuf]) -> usize {
+        if paths.is_empty() {
+            return 0;
+        }
+        let mut marked = 0;
+        for path in paths {
+            if let Some(idx) = self.find_path_index(path) {
+                let (is_dir, already_pending) = {
+                    let node = self.arena.node(idx);
+                    (node.is_dir(), node.content_pending())
+                };
+                if is_dir {
+                    continue;
+                }
+                if !already_pending {
+                    self.arena.node_mut(idx).set_content_pending(true);
+                    self.generation.fetch_add(1, Ordering::SeqCst);
+                }
+                marked += 1;
+            }
+        }
+        if let Some(db) = self.db.as_ref()
+            && let Err(e) = db.mark_paths_content_pending(paths)
+        {
+            eprintln!("[Kensaku] Failed to mark paths pending: {e}");
+        }
+        marked
+    }
+
     /// Forces a content re-read for every file (used after a content-index
     /// schema migration). Directories keep their metadata.
     pub fn mark_all_content_pending(&mut self) -> usize {

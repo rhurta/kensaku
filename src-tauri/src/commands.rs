@@ -1178,7 +1178,7 @@ pub async fn complete_setup(
     crate::embed::set_max_semantic_units(config.content_max_semantic_units);
     crate::ocr::set_engine(&config.ocr_engine);
     crate::indexer::extract::set_external_extractors(config.extractors.clone());
-    crate::indexer::extract::set_name_only_dirs(config.name_only_dirs.clone());
+    crate::indexer::extract::set_path_modes(&config.watched_dirs, &config.name_only_dirs);
     *state.indexer.config.write() = config.clone();
     if let Some(daemon) = state.daemon.as_ref() {
         // In daemon mode this window cannot write the stores; ask the daemon
