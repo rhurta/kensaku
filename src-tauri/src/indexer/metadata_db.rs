@@ -31,6 +31,16 @@ impl MetadataDb {
         Ok(())
     }
 
+    /// Makes the batch so far durable and starts the next one. A crawl that is
+    /// killed mid-way (app closed, crash) otherwise rolls back every row it
+    /// wrote, so the next launch sees the whole tree as new and re-reads it.
+    pub fn commit_and_reopen(&self) -> Result<(), String> {
+        self.commit_transaction()?;
+        // Keeps the WAL from growing for the whole crawl; PASSIVE never blocks.
+        self.checkpoint_passive();
+        self.begin_transaction()
+    }
+
     pub fn open() -> Result<Self, String> {
         let db_dir = KensakuConfig::config_dir();
         std::fs::create_dir_all(&db_dir)
@@ -61,6 +71,7 @@ impl MetadataDb {
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
              PRAGMA foreign_keys=ON;
+             PRAGMA busy_timeout=5000;
              PRAGMA mmap_size=268435456;
              PRAGMA journal_size_limit=67108864;
              PRAGMA optimize;
@@ -76,7 +87,7 @@ impl MetadataDb {
                dev INTEGER NOT NULL DEFAULT 0,
                ino INTEGER NOT NULL DEFAULT 0
              );
-             CREATE INDEX IF NOT EXISTS nodes_path ON nodes(path);
+             DROP INDEX IF EXISTS nodes_path; -- UNIQUE(path) already indexes it; a second copy doubles every write
              CREATE TABLE IF NOT EXISTS usage (
                path TEXT PRIMARY KEY,
                opens INTEGER NOT NULL DEFAULT 0,
@@ -1298,6 +1309,21 @@ impl MetadataDb {
         Ok(marked)
     }
 
+    /// Marks every file below `dir` as needing a content re-read.
+    pub fn mark_dir_content_pending(&self, dir: &Path) -> Result<usize, String> {
+        let mut prefix = dir.to_string_lossy().into_owned();
+        if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
+            prefix.push(std::path::MAIN_SEPARATOR);
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE nodes SET content_pending = 1, retry_count = 0
+             WHERE is_dir = 0 AND substr(path, 1, length(?1)) = ?1",
+            params![prefix],
+        )
+        .map_err(|e| format!("Failed to mark '{}' pending: {}", dir.display(), e))
+    }
+
     /// Marks every file as needing a content re-read.
     pub fn mark_all_content_pending(&self) -> Result<usize, String> {
         let conn = self.conn.lock();
@@ -1317,6 +1343,32 @@ impl MetadataDb {
         )
         .map_err(|e| format!("Failed to mark '{}' pending: {}", path.display(), e))?;
         Ok(())
+    }
+
+    /// Flags exactly these files for a content re-read and a re-embedding.
+    ///
+    /// `indexed_gen` has to go back to 0 as well: a file that was embedded
+    /// before it became names-only still has `indexed_gen = 1`, so resetting
+    /// only `content_pending` would restore its full-text document but never
+    /// its semantic units.
+    pub fn mark_paths_content_pending(&self, paths: &[PathBuf]) -> Result<usize, String> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "UPDATE nodes SET content_pending = 1, retry_count = 0, indexed_gen = 0
+                 WHERE path = ?1",
+            )
+            .map_err(|e| format!("Failed to prepare pending-path update: {e}"))?;
+        let mut total = 0;
+        for path in paths {
+            total += stmt
+                .execute(params![path.to_string_lossy().to_string()])
+                .map_err(|e| format!("Failed to mark '{}' pending: {}", path.display(), e))?;
+        }
+        Ok(total)
     }
 
     /// How many times extraction has been attempted and left pending, and
@@ -1621,6 +1673,33 @@ mod tests {
             .into_iter()
             .map(|entry| entry.path)
             .collect()
+    }
+
+    #[test]
+    fn commit_and_reopen_makes_rows_durable_for_a_killed_crawl() {
+        let temp = TempDb::new("commit-reopen");
+        let db = temp.db();
+        db.begin_transaction().unwrap();
+        db.upsert(&entry(Path::new("/a/one.txt"), false)).unwrap();
+        db.commit_and_reopen().unwrap();
+        db.upsert(&entry(Path::new("/a/two.txt"), false)).unwrap();
+
+        // A second connection sees only what was committed, as a restarted
+        // app would after the crawl was killed.
+        let other = rusqlite::Connection::open_with_flags(
+            temp.dir.join("metadata.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let seen: Vec<String> = other
+            .prepare("SELECT path FROM nodes")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(seen.len(), 1, "only the committed row is visible: {seen:?}");
+        assert!(seen[0].ends_with("one.txt"));
     }
 
     #[test]

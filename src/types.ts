@@ -6,6 +6,12 @@ export interface SnippetDto {
   snippet: string | null;
 }
 
+export interface TransferReport {
+  done: string[];
+  skipped: number;
+  failed: { path: string; error: string }[];
+}
+
 export interface SearchResult {
   path: string;
   filename: string;
@@ -61,6 +67,7 @@ export interface HomeData {
   recent: HomeItem[];
   pins: HomeItem[];
   saved_searches: SavedSearch[];
+  recent_queries?: string[];
 }
 
 export interface ActiveFilter {
@@ -169,6 +176,7 @@ export interface KensakuConfig {
   content_depth?: string;
   content_max_file_size_mb?: number;
   content_max_text_bytes?: number;
+  content_csv_head_rows?: number;
   content_max_semantic_units?: number;
   crawl_mode?: "full" | "balanced" | "eco";
   pause_indexing?: boolean;
@@ -193,6 +201,8 @@ export interface KensakuConfig {
   agent_scoped_roots?: string[];
   /** Include .gitignore/.cursorignore-matched files in the index. */
   include_ignored?: boolean;
+  /** Directories indexed by file name only (no content extraction). */
+  name_only_dirs?: string[];
   /** Show generated thumbnails on result cards (default on). */
   show_thumbnails?: boolean;
   /** Result layout. */

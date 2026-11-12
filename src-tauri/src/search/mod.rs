@@ -112,7 +112,7 @@ fn classify_extension(ext: &str) -> (usize, Option<usize>) {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "ico" | "tiff" | "tif"
         | "heic" | "avif" => (1, None),
         "pdf" | "txt" | "doc" | "docx" | "ppt" | "pptx" | "odp" | "key" | "xls" | "xlsx"
-        | "csv" | "tsv" | "ods" | "rtf" | "odt" | "pages" | "epub" | "log" => (2, None),
+        | "csv" | "tsv" | "ods" | "rtf" | "eml" | "msg" | "odt" | "pages" | "epub" | "log" => (2, None),
         "lua" | "zig" | "nim" | "html" | "css" | "scss" | "xml" | "sql" | "conf" => (3, None),
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "mp3" | "flac" | "wav" | "ogg" | "m4a"
         | "aac" | "opus" => (4, None),
@@ -1049,7 +1049,12 @@ impl SearchDispatcher {
             && !search_text.is_empty()
             && !has_near
             && ModelRegistry::global().is_enabled();
-        let wants_visual = visual_store.is_some() && !search_text.is_empty() && !has_near;
+        // No encoder means the visual tier never runs; building the id map for it
+        // would cost O(corpus) on every text query for nothing.
+        let wants_visual = crate::embed::visual::visual_available()
+            && visual_store.is_some()
+            && !search_text.is_empty()
+            && !has_near;
         let (node_to_idx, allowed_node_ids): (HashMap<u64, usize>, Option<HashSet<u64>>) =
             if wants_semantic || wants_visual {
                 let mut map = HashMap::new();
@@ -1060,7 +1065,8 @@ impl SearchDispatcher {
                         map.insert(entry.id, idx);
                     }
                 }
-                let allowed = if map.is_empty() {
+                // An unfiltered query allows every node, so the set filters nothing.
+                let allowed = if map.is_empty() || candidate_set.all {
                     None
                 } else {
                     Some(map.keys().copied().collect())
@@ -1897,11 +1903,11 @@ fn matches_type_category(typ: &str, ext_opt: Option<&str>, is_dir: bool) -> bool
     if ext_is(typ, &["doc", "document"]) {
         return ext_is(
             ext,
-            &["doc", "docx", "odt", "rtf", "pdf", "txt", "md", "pages", "epub"],
+            &["doc", "docx", "odt", "rtf", "eml", "msg", "pdf", "txt", "md", "pages", "epub"],
         );
     }
     if ext_is(typ, &["sheet", "spreadsheet", "table"]) {
-        return ext_is(ext, &["xlsx", "xls", "ods", "csv", "tsv", "numbers"]);
+        return ext_is(ext, &["xlsx", "xls", "ods", "csv", "tsv", "parquet", "numbers"]);
     }
     if ext_is(typ, &["presentation", "slide", "slides"]) {
         return ext_is(ext, &["pptx", "ppt", "odp", "key"]);

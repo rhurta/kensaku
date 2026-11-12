@@ -113,8 +113,12 @@ impl MetadataStore {
         *self.bursts.write() = None;
 
         let count = entries.len();
-        // First pass: push nodes (parents resolved later).
+        // First pass: push nodes (parents resolved later). The path index is
+        // built last: its `grow` re-keys slots from `arena.path()`, which is only
+        // the bare file name until parents are linked.
         let mut idxs = Vec::with_capacity(entries.len());
+        let mut by_path: std::collections::HashMap<&Path, u32> =
+            std::collections::HashMap::with_capacity(entries.len());
         for entry in &entries {
             let ext_id = self.arena.intern_ext(entry.extension);
             let (name_off, name_len) = self.arena.names.push(&entry.name);
@@ -139,12 +143,16 @@ impl MetadataStore {
                 node_id: entry.id,
             };
             let idx = self.arena.push(node);
-            self.path_index.insert(&self.arena, &entry.path, idx);
+            by_path.insert(entry.path.as_path(), idx);
             idxs.push(idx);
         }
         // Second pass: resolve parent pointers.
         for (entry, &idx) in entries.iter().zip(idxs.iter()) {
-            let parent = self.parent_index_for(&entry.path);
+            let parent = entry
+                .path
+                .parent()
+                .and_then(|parent| by_path.get(parent).copied())
+                .unwrap_or(NO_PARENT);
             if parent == NO_PARENT {
                 let full = entry.path.to_string_lossy().into_owned();
                 let (off, len) = self.arena.names.push(&full);
@@ -156,6 +164,10 @@ impl MetadataStore {
                 let node = self.arena.node_mut(idx);
                 node.parent = parent;
             }
+        }
+        // Third pass: every node now has its final name and parent.
+        for (entry, &idx) in entries.iter().zip(idxs.iter()) {
+            self.path_index.insert(&self.arena, &entry.path, idx);
         }
 
         if let Ok(loaded_bursts) = db.load_bursts() {
@@ -436,6 +448,70 @@ impl MetadataStore {
             }
         }
 
+        marked
+    }
+
+    /// Flags every file below any of `dirs` for a content re-read. Used when a
+    /// directory leaves name-only mode: its files are unchanged on disk, so
+    /// without the flag the crawl would never extract them.
+    pub fn mark_dirs_pending(&mut self, dirs: &[PathBuf]) -> usize {
+        if dirs.is_empty() {
+            return 0;
+        }
+        let mut marked = 0;
+        for i in 0..self.arena.len() {
+            let idx = i as u32;
+            if self.arena.node(idx).is_dir() {
+                continue;
+            }
+            let path = self.arena.path(idx);
+            if dirs.iter().any(|dir| path.starts_with(dir)) {
+                self.arena.node_mut(idx).set_content_pending(true);
+                marked += 1;
+            }
+        }
+        if marked > 0 {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(db) = self.db.as_ref() {
+            for dir in dirs {
+                if let Err(e) = db.mark_dir_content_pending(dir) {
+                    eprintln!("[Kensaku] Failed to mark directory pending: {}", e);
+                }
+            }
+        }
+        marked
+    }
+
+    /// Flags exactly these files for a content re-read. Used when a path's
+    /// effective index mode changes back to "name + content": the files are
+    /// unchanged on disk, so the incremental crawl would otherwise skip them.
+    pub fn mark_paths_pending(&mut self, paths: &[PathBuf]) -> usize {
+        if paths.is_empty() {
+            return 0;
+        }
+        let mut marked = 0;
+        for path in paths {
+            if let Some(idx) = self.find_path_index(path) {
+                let (is_dir, already_pending) = {
+                    let node = self.arena.node(idx);
+                    (node.is_dir(), node.content_pending())
+                };
+                if is_dir {
+                    continue;
+                }
+                if !already_pending {
+                    self.arena.node_mut(idx).set_content_pending(true);
+                    self.generation.fetch_add(1, Ordering::SeqCst);
+                }
+                marked += 1;
+            }
+        }
+        if let Some(db) = self.db.as_ref()
+            && let Err(e) = db.mark_paths_content_pending(paths)
+        {
+            eprintln!("[Kensaku] Failed to mark paths pending: {e}");
+        }
         marked
     }
 
@@ -1019,6 +1095,26 @@ mod tests {
     }
 
     #[test]
+    fn mark_dirs_pending_flags_only_files_below_the_directory() {
+        let mut temp = TempStore::new("mark-dirs");
+        let media = temp.dir.join("media");
+        let inside = media.join("clip.txt");
+        let outside = temp.dir.join("media-notes.txt");
+        let elsewhere = temp.dir.join("docs").join("a.txt");
+
+        let store = temp.store();
+        store.add(entry(&inside, false));
+        store.add(entry(&outside, false));
+        store.add(entry(&elsewhere, false));
+
+        assert_eq!(store.mark_dirs_pending(std::slice::from_ref(&media)), 1);
+        assert!(store.get(&inside).expect("inside").content_pending);
+        // A sibling whose name merely starts with the same text is not below it.
+        assert!(!store.get(&outside).expect("outside").content_pending);
+        assert!(!store.get(&elsewhere).expect("elsewhere").content_pending);
+    }
+
+    #[test]
     fn mark_all_content_pending_skips_directories() {
         let mut temp = TempStore::new("mark-all");
         let image = temp.dir.join("photo.jpg");
@@ -1088,5 +1184,43 @@ mod tests {
             "replacing an entry must preserve its pending flag"
         );
         assert_eq!(stored.size, 20, "the new metadata must still be applied");
+    }
+
+    #[test]
+    fn reloading_from_the_database_finds_every_path() {
+        let mut temp = TempStore::new("reload");
+        let root = temp.dir.join("root");
+        let store = temp.store();
+        store.add(entry(&root, true));
+        // Same file names in every directory, and enough rows to force the
+        // path index to grow several times while loading.
+        let names = ["index.js", "README.md", "notes.txt", "a.png"];
+        let mut paths = vec![root.clone()];
+        for d in 0..30 {
+            let dir = root.join(format!("dir{d}"));
+            store.add(entry(&dir, true));
+            paths.push(dir.clone());
+            for f in 0..20 {
+                let file = dir.join(format!("{f}-{}", names[f % names.len()]));
+                let same_name = dir.join(names[f % names.len()]);
+                store.add(entry(&file, false));
+                store.add(entry(&same_name, false));
+                paths.push(file);
+                paths.push(same_name);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+
+        temp.store.take();
+        let db = MetadataDb::open_in_dir(&temp.dir).expect("reopen db");
+        let reloaded = MetadataStore::with_db(db);
+
+        for path in &paths {
+            let idx = reloaded.get_index(path);
+            assert!(idx.is_some(), "lost after reload: {}", path.display());
+            assert_eq!(&reloaded.path(idx.unwrap()), path);
+        }
+        assert_eq!(reloaded.len(), paths.len());
     }
 }

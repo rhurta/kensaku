@@ -31,6 +31,7 @@ import {
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
 import { useLanguage } from "../hooks/useLanguage";
+import type { SupportedLanguage } from "../i18n";
 import { useStats } from "../hooks/useStats";
 import { Card, Field, Switch, Stepper, SectionHeader, reasonFrom } from "./settings/kit";
 import { WindowModePicker } from "./WindowModePicker";
@@ -417,7 +418,7 @@ function GeneralSection({
           <select
             value={language ?? ""}
             onChange={(e) => {
-              const value = e.target.value === "" ? null : (e.target.value as "en" | "zh");
+              const value = e.target.value === "" ? null : (e.target.value as SupportedLanguage);
               setLanguage(value);
               /* Match the ThemeSwatch handling: keep the settings snapshot in
                  step so a later Save does not write the old language back. */
@@ -549,6 +550,19 @@ function FoldersSection({
     }
   };
 
+  const nameOnlyDirs = config.name_only_dirs ?? [];
+  const toggleNameOnly = (dir: string) =>
+    setConfig((c) => {
+      if (!c) return c;
+      const current = c.name_only_dirs ?? [];
+      return {
+        ...c,
+        name_only_dirs: current.includes(dir)
+          ? current.filter((d) => d !== dir)
+          : [...current, dir],
+      };
+    });
+
   const addDropped = (paths: string[]) =>
     setConfig((c) => {
       if (!c) return c;
@@ -567,24 +581,46 @@ function FoldersSection({
             key={dir}
             className="flex items-center justify-between gap-3 border-b border-line px-4 py-2.5 last:border-b-0"
           >
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <p className="truncate text-[12px] text-fg">
                 {dir.split("/").filter(Boolean).pop() || dir}
               </p>
               <p className="truncate font-mono text-[11px] text-subtle">{dir}</p>
             </div>
+            <div className="ml-auto flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={nameOnlyDirs.includes(dir)}
+              title={t("folders.nameOnlyHint", { dir })}
+              onClick={() => toggleNameOnly(dir)}
+              className={`shrink-0 rounded-control border px-2 py-1 text-[11px] transition-colors ${
+                nameOnlyDirs.includes(dir)
+                  ? "border-accent bg-accent-soft text-fg"
+                  : "border-line text-subtle hover:text-fg"
+              }`}
+            >
+              {t("folders.nameOnly")}
+            </button>
             <button
               type="button"
               title={t("folders.stopWatching", { dir })}
               onClick={() =>
                 setConfig((c) =>
-                  c ? { ...c, watched_dirs: c.watched_dirs.filter((d) => d !== dir) } : c,
+                  c
+                    ? {
+                        ...c,
+                        watched_dirs: c.watched_dirs.filter((d) => d !== dir),
+                        name_only_dirs: (c.name_only_dirs ?? []).filter((d) => d !== dir),
+                      }
+                    : c,
                 )
               }
               className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-subtle transition-colors hover:bg-accent-soft hover:text-danger"
             >
               <X className="h-3.5 w-3.5" />
             </button>
+            </div>
           </div>
         ))}
 
@@ -1557,7 +1593,7 @@ function AboutSection({
   config: KensakuConfig | null;
   setConfig: React.Dispatch<React.SetStateAction<KensakuConfig | null>>;
 }) {
-  const { t } = useTranslation("settings");
+  const { t, i18n } = useTranslation("settings");
   const resetPending = useResetPending();
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [version, setVersion] = useState<string>("…");
@@ -1753,7 +1789,7 @@ function AboutSection({
                       </span>
                       {updateInfo.published_at && (
                         <span className="text-[11px] text-subtle">
-                          {t("about.publishedOn", { date: formatReleaseDate(updateInfo.published_at) })}
+                          {t("about.publishedOn", { date: formatReleaseDate(updateInfo.published_at, i18n.language) })}
                         </span>
                       )}
                     </div>
